@@ -5,6 +5,20 @@
 // </copyright>
 // -----------------------------------------------------------------------
 
+using System;
+using System.Collections.Generic;
+using System.Formats.Tar;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
+using System.Reflection;
+using System.Text;
+using System.Threading.Tasks;
+using ICSharpCode.SharpZipLib.GZip;
+using ICSharpCode.SharpZipLib.Tar;
+using Octokit;
+
 namespace Exiled.Installer
 {
     using System;
@@ -58,8 +72,9 @@ namespace Exiled.Installer
 
         private static async Task Main(string[] args)
         {
-            Console.OutputEncoding = new UTF8Encoding(false, false);
-            await CommandSettings.Parse(args).ConfigureAwait(false);
+            await NewInstaller.Install(new InstallSettings());
+            // Console.OutputEncoding = new UTF8Encoding(false, false);
+            // await CommandSettings.Parse(args).ConfigureAwait(false);
         }
 
         internal static async Task MainSafe(CommandSettings args)
@@ -303,4 +318,191 @@ namespace Exiled.Installer
             return enumerable.First();
         }
     }
+}
+
+internal static class NewInstaller
+{
+    /// <summary>
+    /// The default GitHub client used to download releases from GitHub.
+    /// </summary>
+    private static readonly GitHubClient Client = new(new ProductHeaderValue($"{Assembly.GetExecutingAssembly().GetName().Name}-{Assembly.GetExecutingAssembly().GetName().Version}"));
+    
+    /// <summary>
+    /// Checks and installs EXILED from GitHub using the configured settings.
+    /// </summary>
+    public static async Task Install(InstallSettings settings)
+    {
+        Console.WriteLine("Preparing to install EXILED...");
+        IEnumerable<Release> AvailableReleases = await GetAvailableReleases(settings);
+
+#if DEBUG
+        Console.WriteLine("---- RELEASES ----");
+        foreach (Release release in AvailableReleases)
+            Console.WriteLine($"> '{release.TagName}' (ID: {release.Id}) | CHANNEL: {(release.Prerelease ? "BETA" : "STABLE")}");
+#endif
+        // Now download the latest release and compare asset hashes
+        Release? ReleaseToInstall = AvailableReleases.FirstOrDefault();
+
+        if (ReleaseToInstall == null)
+        {
+            Console.WriteLine("Unable to install EXILED! An error occured while trying to get the latest release.");
+            Environment.Exit(2); // CODE: 2 (No Available Release to install.)
+        }
+
+        await DownloadRelease(ReleaseToInstall, settings);
+    }
+
+    /// <summary>
+    /// Checks and installs EXILED from GitHub using the configured settings.
+    /// </summary>
+    private static async Task<IEnumerable<Release>> GetAvailableReleases(InstallSettings settings)
+    {
+        Console.WriteLine($"FEED: {settings.InstallFeed.Owner}/{settings.InstallFeed.Repository}");
+        IEnumerable<Release> releases = (await Client.Repository.Release.GetAll(settings.InstallFeed.Owner, settings.InstallFeed.Repository))
+            .Where(x => x.Prerelease == false || x.Prerelease == settings.AllowPreReleases);
+        return releases.OrderByDescending(r => r.CreatedAt.Ticks);
+    }
+
+    private static async Task DownloadRelease(Release targetRelease, InstallSettings settings, bool saveToCache = false)
+    {
+        Console.WriteLine($"DOWNLOADING RELEASE: '{targetRelease.TagName}' (ID: {targetRelease.Id}) | CHANNEL: {(targetRelease.Prerelease ? "BETA" : "STABLE")}");
+        
+        HttpClient downloadClient = new()
+        {
+            Timeout = TimeSpan.FromMinutes(1) // Default to 2 minutes to allow any proxy issues to be resolved.
+        };
+        downloadClient.DefaultRequestHeaders.Add("User-Agent", settings.InstallFeed.ToString());
+
+        // Locate the appropriately named zip file.
+        ReleaseAsset? dataPacket = targetRelease.Assets.FirstOrDefault(a => a.Name.Equals("exiled.tar.gz", StringComparison.OrdinalIgnoreCase));
+
+        if (dataPacket == null)
+        {
+            Console.WriteLine("Unable to install EXILED! An error occured while trying to get the latest release asset.");
+            Environment.Exit(3); // CODE: 3 (No Available Release Asset was found.)
+        }
+
+        // Perform the download.
+        HttpResponseMessage reponseMessage = await downloadClient.GetAsync(dataPacket.BrowserDownloadUrl);
+        Stream downloadStream = await reponseMessage.Content.ReadAsStreamAsync();
+        
+        Console.WriteLine("EXILED was installed successfully.");
+    }
+
+    private static void ProcessTarEntry(TarInputStream tarInputStream, TarEntry entry)
+    {
+        if (entry.IsDirectory)
+        {
+            TarEntry[] entries = entry.GetDirectoryEntries();
+
+            for (int z = 0; z < entries.Length; z++)
+                ProcessTarEntry(args, tarInputStream, entries[z]);
+        }
+        else
+        {
+            if (entry.Name.Contains("example", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            switch (ResolveEntry(entry))
+            {
+                case PathResolution.Absolute:
+                    ResolvePath(entry.Name, args.AppData.FullName, out string path);
+                    ExtractEntry(tarInputStream, entry, path);
+                    break;
+                case PathResolution.Exiled:
+                    ResolvePath(entry.Name, args.Exiled.FullName, out path);
+                    ExtractEntry(tarInputStream, entry, path);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    private static void ExtractEntry(TarInputStream tarInputStream, TarEntry entry, string path)
+    {
+        EnsureDirExists(Path.GetDirectoryName(path)!);
+
+        FileStream? fs = null;
+        try
+        {
+            fs = new FileStream(path, System.IO.FileMode.Create, FileAccess.Write, FileShare.None);
+            tarInputStream.CopyEntryContents(fs);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex);
+        }
+        finally
+        {
+            fs?.Dispose();
+        }
+    }
+
+    private static PathResolution ResolveEntry(TarEntry entry)
+    {
+        static PathResolution TryParse(string s)
+        {
+            // We'll get UNDEFINED if it cannot be determined
+            Enum.TryParse(s, true, out PathResolution result);
+            return result;
+        }
+
+        string fileName = entry.Name;
+        bool fileInFolder = !string.IsNullOrEmpty(Path.GetDirectoryName(fileName));
+        foreach (KeyValuePair<string, string> pair in Markup)
+        {
+            bool isFolder = pair.Key.EndsWith('\\');
+            if (fileInFolder && isFolder &&
+                pair.Key[0..^1].Equals(fileName.Substring(0, fileName.IndexOf(Path.DirectorySeparatorChar)), StringComparison.OrdinalIgnoreCase))
+                return TryParse(pair.Value);
+
+            if (!fileInFolder && !isFolder && pair.Key.Equals(fileName, StringComparison.OrdinalIgnoreCase))
+                return TryParse(pair.Value);
+        }
+
+        return PathResolution.Undefined;
+    }
+
+    private static void EnsureDirExists(string pathToDir)
+    {
+        if (!Directory.Exists(pathToDir))
+            Directory.CreateDirectory(pathToDir);
+    }
+    private static void ResolvePath(string filePath, string folderPath, out string path) => path = Path.Combine(folderPath, filePath);
+}
+
+internal class InstallSettings
+{
+    /// <summary>
+    /// The feed to download releases from. Default is ExMod-Team/EXILED.
+    /// </summary>
+    public FeedInfo InstallFeed { get; set; } = new();
+
+    /// <summary>
+    /// Allows Pre-Releases to be found/downloaded/installed. Default is false.
+    /// </summary>
+    public bool AllowPreReleases { get; set; } = true;
+}
+
+internal record FeedInfo
+{
+    public string Owner { get; set; } = "ExMod-Team";
+    public string Repository { get; set; } = "EXILED";
+    public override string ToString() => $"{Owner}/{Repository}";
+}
+
+internal enum PathResolution
+{
+    Undefined,
+
+    /// <summary>
+    /// Absolute path that is routed to AppData.
+    /// </summary>
+    Absolute,
+
+    /// <summary>
+    /// Exiled path that is routed to exiled root path.
+    /// </summary>
+    Exiled,
 }
